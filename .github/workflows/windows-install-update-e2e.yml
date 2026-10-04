@@ -46,6 +46,18 @@ jobs:
           test-environment: 'true'
           prune-python-cache: true
 
+      - name: Desktop updater Windows tests (wine2e proof)
+        shell: bash
+        continue-on-error: true
+        run: |
+          scripts/run_tests.sh tests/scripts/desktop_update/ -- \
+            -m "platforms and not integration" -v --tb=short -rA
+        env:
+          HERMES_TEST_WORKERS: '16'
+          OPENROUTER_API_KEY: ''
+          OPENAI_API_KEY: ''
+          NOUS_API_KEY: ''
+
       - name: Run Windows install + update E2E
         shell: bash
         run: |
