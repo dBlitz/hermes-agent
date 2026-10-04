@@ -1758,7 +1758,7 @@ def link_tasks(
             conn,
             child_id,
             "linked",
-            {"parent": parent_id, "child": child_id},
+            {"parent": parent_id, "child": child_id, "inserted": not bool(existing_link)},
             run_id=child["current_run_id"] if child["status"] == "running" and not existing_link else None,
         )
         _inherit_notify_subs(conn, child_id, (parent_id,))

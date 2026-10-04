@@ -32,14 +32,20 @@ def completed_owned_handoff(
     )}
     seen = set()
     for event in conn.execute(
-        "SELECT id, run_id, payload FROM task_events "
-        "WHERE task_id = ? AND kind = 'linked' ORDER BY id DESC", (task_id,),
+        "SELECT id, kind, run_id, payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('linked', 'unlinked') ORDER BY id DESC", (task_id,),
     ):
-        parent = _json_dict(event["payload"]).get("parent")
+        payload = _json_dict(event["payload"])
+        parent = payload.get("parent")
         if parent not in parents or parent in seen:
             continue
+        # Only source-confirmed duplicates preserve the insertion beneath them.
+        # Unlink and unknown legacy events are barriers, never ownership proof.
+        if event["kind"] == "linked" and payload.get("inserted") is False:
+            continue
         seen.add(parent)
-        if event["run_id"] != expected_run_id or event["id"] <= claim["id"]:
+        if (event["kind"] != "linked" or payload.get("inserted") is not True
+                or event["run_id"] != expected_run_id or event["id"] <= claim["id"]):
             continue
         if conn.execute(
             "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'completed' "

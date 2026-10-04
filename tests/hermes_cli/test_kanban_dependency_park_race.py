@@ -25,6 +25,37 @@ def running(conn, title):
     return claimed
 
 
+@pytest.mark.parametrize("duplicate_at", ["before_completion", "after_completion"])
+def test_duplicate_current_run_preserves_insertion(board, monkeypatch, duplicate_at):
+    monkeypatch.setattr(kb.time, "time", lambda: 1700000000)
+    manager = running(board, "manager")
+    helper = running(board, "helper")
+    def link():
+        assert kb.link_tasks(board, helper.id, manager.id,
+                             expected_child_run_id=manager.current_run_id) is False
+    link()
+    if duplicate_at == "before_completion":
+        link()
+    assert kb.complete_task(board, helper.id, result="handoff",
+                            expected_run_id=helper.current_run_id)
+    if duplicate_at == "after_completion":
+        link()
+    assert kb.block_task(board, manager.id, kind="dependency",
+                         expected_run_id=manager.current_run_id)
+    parked = kb.get_task(board, manager.id)
+    assert (parked.status, parked.block_kind) == ("todo", "dependency")
+    assert kb.recompute_ready(board) == 1
+    assert kb.recompute_ready(board) == 0
+    resumed = kb.claim_task(board, manager.id, claimer="worker")
+    assert resumed is not None
+    assert kb.link_tasks(board, helper.id, manager.id,
+                         expected_child_run_id=resumed.current_run_id) is False
+    assert kb.block_task(board, manager.id, kind="dependency",
+                         expected_run_id=resumed.current_run_id)
+    assert kb.get_task(board, manager.id).block_kind == "needs_input"
+    assert kb.recompute_ready(board) == 0
+
+
 def test_owned_upstream_completion_before_park_resumes_once(board, monkeypatch):
     now = kb.time.time()
     monkeypatch.setattr(kb.time, "time", lambda: now)
@@ -57,6 +88,7 @@ def test_owned_upstream_completion_before_park_resumes_once(board, monkeypatch):
 @pytest.mark.parametrize("scenario", [
     "park_before_completion", "prior_terminal_parent", "old_edge", "no_parent",
     "stale_run", "multiple_parents", "no_ownership", "duplicate_old_edge",
+    "readded_after_completion", "readded_before_completion",
 ])
 def test_dependency_handoff_controls(board, monkeypatch, scenario):
     # Every event deliberately shares one timestamp; only durable order counts.
@@ -79,6 +111,10 @@ def test_dependency_handoff_controls(board, monkeypatch, scenario):
     if scenario not in ("old_edge", "no_parent"):
         kb.link_tasks(board, helper.id, manager.id,
                       expected_child_run_id=manager.current_run_id)
+    if scenario == "readded_before_completion":
+        assert kb.unlink_tasks(board, helper.id, manager.id)
+        kb.link_tasks(board, helper.id, manager.id,
+                      expected_child_run_id=manager.current_run_id)
     pending = None
     if scenario == "multiple_parents":
         pending = running(board, "pending helper")
@@ -87,6 +123,14 @@ def test_dependency_handoff_controls(board, monkeypatch, scenario):
     if scenario not in ("park_before_completion", "prior_terminal_parent", "old_edge", "duplicate_old_edge"):
         assert kb.complete_task(board, helper.id, result="current handoff",
                                 expected_run_id=helper.current_run_id)
+    if scenario == "readded_after_completion":
+        assert kb.unlink_tasks(board, helper.id, manager.id)
+        kb.link_tasks(board, helper.id, manager.id,
+                      expected_child_run_id=manager.current_run_id)
+    if scenario.startswith("readded_"):
+        # A duplicate cannot make the newest insertion borrow older evidence.
+        kb.link_tasks(board, helper.id, manager.id,
+                      expected_child_run_id=manager.current_run_id)
     expected_run_id = manager.current_run_id
     if scenario == "stale_run":
         expected_run_id = helper.current_run_id
@@ -104,6 +148,10 @@ def test_dependency_handoff_controls(board, monkeypatch, scenario):
         return
     assert changed
     parked = kb.get_task(board, manager.id)
+    if scenario == "readded_before_completion":
+        assert (parked.status, parked.block_kind) == ("todo", "dependency")
+        assert kb.recompute_ready(board) == 1
+        return
     if scenario in ("park_before_completion", "multiple_parents"):
         assert (parked.status, parked.block_kind) == ("todo", "dependency")
         assert parked.block_recurrences == 0
