@@ -1734,6 +1734,10 @@ def link_tasks(
             raise ValueError(f"cannot link {parent_id} -> {child_id}: child is already running")
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
+        existing_link = conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (parent_id, child_id),
+        ).fetchone()
         _link(conn, parent_id, child_id)
         # If child was ready but parent is not yet terminal, demote child to todo
         # (archived counts as terminal, matching _parents_satisfied/recompute_ready).
@@ -1754,7 +1758,8 @@ def link_tasks(
             conn,
             child_id,
             "linked",
-            {"parent": parent_id, "child": child_id},
+            {"parent": parent_id, "child": child_id, "inserted": not bool(existing_link)},
+            run_id=child["current_run_id"] if child["status"] == "running" and not existing_link else None,
         )
         _inherit_notify_subs(conn, child_id, (parent_id,))
     return gated
@@ -3291,8 +3296,9 @@ def block_task(
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
-    re-kinded to ``needs_input`` (sticky) so ``recompute_ready`` cannot
-    promote it into a context-free respawn. ``transient`` still counts
+    re-kinded to ``needs_input`` unless an owned link in this run completed
+    before parking (see ``completed_owned_handoff``). Sticky blocks ensure
+    ``recompute_ready`` cannot promote it into a context-free respawn. ``transient`` still counts
     toward the loop breaker so a forever-flaky task escalates. True on any
     transition.
 
@@ -3336,13 +3342,15 @@ def block_task(
         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
         requested_kind = kind
         rekind_reason = None
-        # ``dependency`` only waits on incomplete parents. A worker filing that
-        # kind with none open would park in ``todo`` and ``recompute_ready``
-        # would promote+respawn it context-free on the next tick. Re-kind to
-        # ``needs_input`` so it is sticky until a human unblocks.
+        # An owned handoff may complete between linking and parking. Without
+        # that run-scoped evidence, an already-satisfied wait would respawn
+        # context-free; keep it sticky until a human unblocks.
         if kind == "dependency" and _parents_satisfied(conn, task_id):
-            kind = "needs_input"
-            rekind_reason = "no_open_parent"
+            from hermes_cli.kanban_db_graph import completed_owned_handoff
+
+            if not completed_owned_handoff(conn, task_id, expected_run_id):
+                kind = "needs_input"
+                rekind_reason = "no_open_parent"
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
@@ -3387,9 +3395,10 @@ def _route_block(
 
     ``dependency`` never enters the human ``blocked`` bucket: it waits in
     ``todo`` for ``recompute_ready``, so a cron never sees a dependency-wait
-    as something to "unblock". Callers that pass ``dependency`` with no
-    incomplete parent are re-kinded to ``needs_input`` before this runs
-    (see :func:`block_task`). Every other kind counts unblock-loop
+    as something to "unblock". Callers that pass ``dependency`` without an
+    incomplete parent or a completed owned handoff are re-kinded to
+    ``needs_input`` before this runs (see :func:`block_task`). Every other
+    kind counts unblock-loop
     recurrences: block_task only fires from running/ready (AFTER an unblock
     returned the task to the pool), so a stored ``block_kind`` equal to the
     incoming one means blocked -> unblocked -> re-block for the same cause
