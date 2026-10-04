@@ -5,6 +5,50 @@ import sqlite3
 import time
 from typing import Any, Optional
 
+
+def completed_owned_handoff(
+    conn: sqlite3.Connection, task_id: str, expected_run_id: Optional[int],
+) -> bool:
+    """Recognize a native handoff linked and completed during the owning run.
+
+    Event IDs establish ordering even when claim, link and completion share
+    an integer-second timestamp. Old edges and repeated link calls cannot
+    grant a new attempt permission to respawn from an old completion.
+    """
+    from hermes_cli.kanban_db import _json_dict
+
+    if expected_run_id is None:
+        return False
+    claim = conn.execute(
+        "SELECT e.id FROM tasks t JOIN task_events e ON e.task_id = t.id "
+        "WHERE t.id = ? AND t.status = 'running' AND t.current_run_id = ? "
+        "AND e.run_id = t.current_run_id AND e.kind = 'claimed' ORDER BY e.id DESC LIMIT 1",
+        (task_id, expected_run_id),
+    ).fetchone()
+    if claim is None:
+        return False
+    parents = {row["parent_id"] for row in conn.execute(
+        "SELECT parent_id FROM task_links WHERE child_id = ?", (task_id,),
+    )}
+    seen = set()
+    for event in conn.execute(
+        "SELECT id, run_id, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'linked' ORDER BY id DESC", (task_id,),
+    ):
+        parent = _json_dict(event["payload"]).get("parent")
+        if parent not in parents or parent in seen:
+            continue
+        seen.add(parent)
+        if event["run_id"] != expected_run_id or event["id"] <= claim["id"]:
+            continue
+        if conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'completed' "
+            "AND id > ? LIMIT 1", (parent, event["id"]),
+        ).fetchone():
+            return True
+    return False
+
+
 def inherit_creator_origin(
     conn: sqlite3.Connection, task_id: str, creator_task_id: Optional[str], *,
     created_at: int,
